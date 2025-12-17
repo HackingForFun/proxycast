@@ -314,6 +314,7 @@ impl ExportService {
                     api_key: REDACTED_PLACEHOLDER.to_string(),
                     base_url: entry.base_url.clone(),
                     disabled: entry.disabled,
+                    proxy_url: entry.proxy_url.clone(),
                 })
                 .collect(),
             claude: pool
@@ -324,8 +325,13 @@ impl ExportService {
                     api_key: REDACTED_PLACEHOLDER.to_string(),
                     base_url: entry.base_url.clone(),
                     disabled: entry.disabled,
+                    proxy_url: entry.proxy_url.clone(),
                 })
                 .collect(),
+            gemini_api_keys: pool.gemini_api_keys.clone(),
+            vertex_api_keys: pool.vertex_api_keys.clone(),
+            codex: pool.codex.clone(),
+            iflow: pool.iflow.clone(),
         }
     }
 
@@ -619,6 +625,7 @@ mod unit_tests {
             api_key: "sk-pool-key".to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         });
 
         let redacted = ExportService::redact_config(&config);
@@ -658,6 +665,7 @@ mod unit_tests {
             api_key: "sk-real-key".to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         });
 
         assert!(ExportService::contains_secrets(&config));

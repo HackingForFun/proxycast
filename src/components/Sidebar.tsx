@@ -48,9 +48,6 @@ const navItems = [
   { id: "prompts" as Page, label: "Prompts", icon: MessageSquare },
   { id: "skills" as Page, label: "Skills", icon: Boxes },
   { id: "settings" as Page, label: "设置", icon: Settings },
-  // Legacy pages (hidden but accessible)
-  // { id: "providers" as Page, label: "Provider (旧)", icon: Server },
-  // { id: "switch" as Page, label: "Switch (旧)", icon: ArrowLeftRight },
 ];
 
 export function Sidebar({ currentPage, onNavigate }: SidebarProps) {

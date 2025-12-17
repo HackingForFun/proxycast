@@ -21,9 +21,11 @@ pub use hot_reload::{
 pub use import::{ImportError, ImportOptions, ImportResult, ImportService, ValidationResult};
 pub use path_utils::{collapse_tilde, contains_tilde, expand_tilde};
 pub use types::{
-    ApiKeyEntry, Config, CredentialEntry, CredentialPoolConfig, CustomProviderConfig,
-    InjectionRuleConfig, InjectionSettings, LoggingConfig, ProviderConfig, ProvidersConfig,
-    RetrySettings, RoutingConfig, RoutingRuleConfig, ServerConfig,
+    AmpConfig, AmpModelMapping, ApiKeyEntry, Config, CredentialEntry, CredentialPoolConfig,
+    CustomProviderConfig, GeminiApiKeyEntry, IFlowCredentialEntry, InjectionRuleConfig,
+    InjectionSettings, LoggingConfig, ProviderConfig, ProvidersConfig, QuotaExceededConfig,
+    RemoteManagementConfig, RetrySettings, RoutingConfig, RoutingRuleConfig, ServerConfig,
+    TlsConfig, VertexApiKeyEntry, VertexModelAlias,
 };
 pub use yaml::{
     load_config, save_config, save_config_yaml, ConfigError, ConfigManager, YamlService,

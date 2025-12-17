@@ -5,10 +5,12 @@ pub mod credential;
 mod database;
 pub mod injection;
 mod logger;
+pub mod middleware;
 mod models;
 pub mod plugin;
 pub mod processor;
 mod providers;
+pub mod proxy;
 pub mod resilience;
 pub mod router;
 mod server;
@@ -41,6 +43,10 @@ pub enum ProviderType {
     OpenAI,
     Claude,
     Antigravity,
+    Vertex,
+    /// Gemini API Key (multi-account load balancing)
+    #[serde(rename = "gemini_api_key")]
+    GeminiApiKey,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -52,6 +58,8 @@ impl std::fmt::Display for ProviderType {
             ProviderType::OpenAI => write!(f, "openai"),
             ProviderType::Claude => write!(f, "claude"),
             ProviderType::Antigravity => write!(f, "antigravity"),
+            ProviderType::Vertex => write!(f, "vertex"),
+            ProviderType::GeminiApiKey => write!(f, "gemini_api_key"),
         }
     }
 }
@@ -67,6 +75,8 @@ impl std::str::FromStr for ProviderType {
             "openai" => Ok(ProviderType::OpenAI),
             "claude" => Ok(ProviderType::Claude),
             "antigravity" => Ok(ProviderType::Antigravity),
+            "vertex" => Ok(ProviderType::Vertex),
+            "gemini_api_key" => Ok(ProviderType::GeminiApiKey),
             _ => Err(format!("Invalid provider: {s}")),
         }
     }
@@ -92,12 +102,24 @@ mod tests {
             "claude".parse::<ProviderType>().unwrap(),
             ProviderType::Claude
         );
+        assert_eq!(
+            "vertex".parse::<ProviderType>().unwrap(),
+            ProviderType::Vertex
+        );
+        assert_eq!(
+            "gemini_api_key".parse::<ProviderType>().unwrap(),
+            ProviderType::GeminiApiKey
+        );
 
         // 测试大小写不敏感
         assert_eq!("KIRO".parse::<ProviderType>().unwrap(), ProviderType::Kiro);
         assert_eq!(
             "Gemini".parse::<ProviderType>().unwrap(),
             ProviderType::Gemini
+        );
+        assert_eq!(
+            "VERTEX".parse::<ProviderType>().unwrap(),
+            ProviderType::Vertex
         );
 
         // 测试无效的 provider
@@ -111,6 +133,8 @@ mod tests {
         assert_eq!(ProviderType::Qwen.to_string(), "qwen");
         assert_eq!(ProviderType::OpenAI.to_string(), "openai");
         assert_eq!(ProviderType::Claude.to_string(), "claude");
+        assert_eq!(ProviderType::Vertex.to_string(), "vertex");
+        assert_eq!(ProviderType::GeminiApiKey.to_string(), "gemini_api_key");
     }
 
     #[test]
@@ -968,6 +992,14 @@ async fn check_api_compatibility(
             ("gemini-3-pro-preview", "basic"),
             ("gemini-3-pro-preview", "tool_call"),
         ],
+        ProviderType::Vertex => vec![
+            ("gemini-2.0-flash", "basic"),
+            ("gemini-2.0-flash", "tool_call"),
+        ],
+        ProviderType::GeminiApiKey => vec![
+            ("gemini-2.5-flash", "basic"),
+            ("gemini-2.5-flash", "tool_call"),
+        ],
         ProviderType::OpenAI | ProviderType::Claude => vec![],
     };
 
@@ -1238,7 +1270,12 @@ async fn test_api(
 ) -> Result<TestResult, String> {
     let s = state.read().await;
     let base_url = format!("http://{}:{}", s.config.server.host, s.config.server.port);
-    let api_key = &s.config.server.api_key;
+    // 优先使用服务器运行时的 API key，确保测试使用的 key 和服务器一致
+    // 如果服务器未运行，则使用配置中的 key
+    let api_key = s
+        .running_api_key
+        .as_ref()
+        .unwrap_or(&s.config.server.api_key);
 
     // 创建一个禁用代理的客户端
     let client = reqwest::Client::builder()
@@ -1566,6 +1603,7 @@ pub fn run() {
             commands::provider_pool_cmd::get_pool_credential_oauth_status,
             commands::provider_pool_cmd::debug_kiro_credentials,
             commands::provider_pool_cmd::test_user_credentials,
+            commands::provider_pool_cmd::migrate_private_config_to_pool,
             // Route commands
             commands::route_cmd::get_available_routes,
             commands::route_cmd::get_route_curl_examples,

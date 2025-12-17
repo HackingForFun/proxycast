@@ -7,6 +7,7 @@ import {
   HealthCheckResult,
   UpdateCredentialRequest,
   OAuthStatus,
+  MigrationResult,
 } from "@/lib/api/providerPool";
 
 export function useProviderPool() {
@@ -172,6 +173,15 @@ export function useProviderPool() {
     return pool?.stats;
   };
 
+  // Migrate private config to credential pool
+  const migratePrivateConfig = async (
+    config: unknown,
+  ): Promise<MigrationResult> => {
+    const result = await providerPoolApi.migratePrivateConfig(config);
+    await fetchOverview();
+    return result;
+  };
+
   return {
     overview,
     loading,
@@ -195,5 +205,6 @@ export function useProviderPool() {
     getCredentialOAuthStatus,
     getCredentialsByType,
     getStatsByType,
+    migratePrivateConfig,
   };
 }

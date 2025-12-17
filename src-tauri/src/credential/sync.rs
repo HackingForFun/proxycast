@@ -119,6 +119,7 @@ impl CredentialSyncService {
                     id: credential.uuid.clone(),
                     token_file,
                     disabled: credential.is_disabled,
+                    proxy_url: None,
                 };
                 config.credential_pool.kiro.push(entry);
             }
@@ -131,6 +132,7 @@ impl CredentialSyncService {
                     id: credential.uuid.clone(),
                     token_file,
                     disabled: credential.is_disabled,
+                    proxy_url: None,
                 };
                 config.credential_pool.gemini.push(entry);
             }
@@ -141,6 +143,7 @@ impl CredentialSyncService {
                     id: credential.uuid.clone(),
                     token_file,
                     disabled: credential.is_disabled,
+                    proxy_url: None,
                 };
                 config.credential_pool.qwen.push(entry);
             }
@@ -157,6 +160,7 @@ impl CredentialSyncService {
                     api_key: api_key.clone(),
                     base_url: base_url.clone(),
                     disabled: credential.is_disabled,
+                    proxy_url: None,
                 };
                 config.credential_pool.openai.push(entry);
             }
@@ -166,8 +170,72 @@ impl CredentialSyncService {
                     api_key: api_key.clone(),
                     base_url: base_url.clone(),
                     disabled: credential.is_disabled,
+                    proxy_url: None,
                 };
                 config.credential_pool.claude.push(entry);
+            }
+            CredentialData::VertexKey {
+                api_key,
+                base_url,
+                model_aliases,
+            } => {
+                use crate::config::VertexModelAlias;
+                let models: Vec<VertexModelAlias> = model_aliases
+                    .iter()
+                    .map(|(alias, name)| VertexModelAlias {
+                        alias: alias.clone(),
+                        name: name.clone(),
+                    })
+                    .collect();
+                let entry = crate::config::VertexApiKeyEntry {
+                    id: credential.uuid.clone(),
+                    api_key: api_key.clone(),
+                    base_url: base_url.clone(),
+                    models,
+                    proxy_url: None,
+                    disabled: credential.is_disabled,
+                };
+                config.credential_pool.vertex_api_keys.push(entry);
+            }
+            CredentialData::GeminiApiKey {
+                api_key,
+                base_url,
+                excluded_models,
+            } => {
+                use crate::config::GeminiApiKeyEntry;
+                let entry = GeminiApiKeyEntry {
+                    id: credential.uuid.clone(),
+                    api_key: api_key.clone(),
+                    base_url: base_url.clone(),
+                    proxy_url: None,
+                    excluded_models: excluded_models.clone(),
+                    disabled: credential.is_disabled,
+                };
+                config.credential_pool.gemini_api_keys.push(entry);
+            }
+            CredentialData::CodexOAuth { .. } => {
+                // Codex 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "Codex 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            CredentialData::ClaudeOAuth { .. } => {
+                // Claude OAuth 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "Claude OAuth 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            CredentialData::IFlowOAuth { .. } => {
+                // iFlow OAuth 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "iFlow OAuth 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            CredentialData::IFlowCookie { .. } => {
+                // iFlow Cookie 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "iFlow Cookie 凭证暂不支持同步到配置".to_string(),
+                ));
             }
         }
 
@@ -288,6 +356,46 @@ impl CredentialSyncService {
                     "Antigravity 凭证暂不支持同步到配置".to_string(),
                 ));
             }
+            PoolProviderType::Vertex => {
+                if let Some(pos) = config
+                    .credential_pool
+                    .vertex_api_keys
+                    .iter()
+                    .position(|e| e.id == credential_id)
+                {
+                    config.credential_pool.vertex_api_keys.remove(pos);
+                    found = true;
+                }
+            }
+            PoolProviderType::GeminiApiKey => {
+                if let Some(pos) = config
+                    .credential_pool
+                    .gemini_api_keys
+                    .iter()
+                    .position(|e| e.id == credential_id)
+                {
+                    config.credential_pool.gemini_api_keys.remove(pos);
+                    found = true;
+                }
+            }
+            PoolProviderType::Codex => {
+                // Codex 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "Codex 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            PoolProviderType::ClaudeOAuth => {
+                // Claude OAuth 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "Claude OAuth 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            PoolProviderType::IFlow => {
+                // iFlow 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "iFlow 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
         }
 
         if !found {
@@ -396,6 +504,73 @@ impl CredentialSyncService {
                     found = true;
                 }
             }
+            CredentialData::VertexKey {
+                api_key,
+                base_url,
+                model_aliases,
+            } => {
+                if let Some(entry) = config
+                    .credential_pool
+                    .vertex_api_keys
+                    .iter_mut()
+                    .find(|e| e.id == credential.uuid)
+                {
+                    use crate::config::VertexModelAlias;
+                    entry.api_key = api_key.clone();
+                    entry.base_url = base_url.clone();
+                    entry.models = model_aliases
+                        .iter()
+                        .map(|(alias, name)| VertexModelAlias {
+                            alias: alias.clone(),
+                            name: name.clone(),
+                        })
+                        .collect();
+                    entry.disabled = credential.is_disabled;
+                    found = true;
+                }
+            }
+            CredentialData::GeminiApiKey {
+                api_key,
+                base_url,
+                excluded_models,
+            } => {
+                if let Some(entry) = config
+                    .credential_pool
+                    .gemini_api_keys
+                    .iter_mut()
+                    .find(|e| e.id == credential.uuid)
+                {
+                    entry.api_key = api_key.clone();
+                    entry.base_url = base_url.clone();
+                    entry.excluded_models = excluded_models.clone();
+                    entry.disabled = credential.is_disabled;
+                    found = true;
+                }
+            }
+            CredentialData::CodexOAuth { .. } => {
+                // Codex 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "Codex 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            CredentialData::ClaudeOAuth { .. } => {
+                // Claude OAuth 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "Claude OAuth 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            CredentialData::IFlowOAuth { .. } => {
+                // iFlow OAuth 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "iFlow OAuth 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
+            CredentialData::IFlowCookie { .. } => {
+                // iFlow Cookie 暂不支持同步到配置
+                return Err(SyncError::InvalidCredentialType(
+                    "iFlow Cookie 凭证暂不支持同步到配置".to_string(),
+                ));
+            }
         }
 
         if !found {
@@ -485,6 +660,43 @@ impl CredentialSyncService {
                 CredentialData::ClaudeKey {
                     api_key: entry.api_key.clone(),
                     base_url: entry.base_url.clone(),
+                },
+            );
+            let mut cred = cred;
+            cred.uuid = entry.id.clone();
+            cred.is_disabled = entry.disabled;
+            credentials.push(cred);
+        }
+
+        // 加载 Vertex AI 凭证
+        for entry in &config.credential_pool.vertex_api_keys {
+            let model_aliases: std::collections::HashMap<String, String> = entry
+                .models
+                .iter()
+                .map(|m| (m.alias.clone(), m.name.clone()))
+                .collect();
+            let cred = ProviderCredential::new(
+                PoolProviderType::Vertex,
+                CredentialData::VertexKey {
+                    api_key: entry.api_key.clone(),
+                    base_url: entry.base_url.clone(),
+                    model_aliases,
+                },
+            );
+            let mut cred = cred;
+            cred.uuid = entry.id.clone();
+            cred.is_disabled = entry.disabled;
+            credentials.push(cred);
+        }
+
+        // 加载 Gemini API Key 凭证
+        for entry in &config.credential_pool.gemini_api_keys {
+            let cred = ProviderCredential::new(
+                PoolProviderType::GeminiApiKey,
+                CredentialData::GeminiApiKey {
+                    api_key: entry.api_key.clone(),
+                    base_url: entry.base_url.clone(),
+                    excluded_models: entry.excluded_models.clone(),
                 },
             );
             let mut cred = cred;

@@ -51,6 +51,13 @@ const providerModels: Record<PoolProviderType, string[]> = {
   ],
   openai: [], // 自定义 API，无预设模型
   claude: [], // 自定义 API，无预设模型
+  codex: ["gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3-mini"], // Codex OAuth
+  claude_oauth: [
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-haiku-latest",
+    "claude-sonnet-4-20250514",
+  ], // Claude OAuth
+  iflow: ["deepseek-chat", "deepseek-reasoner"], // iFlow
 };
 
 export function EditCredentialModal({
@@ -70,6 +77,10 @@ export function EditCredentialModal({
   // 重新上传文件相关状态
   const [newCredFilePath, setNewCredFilePath] = useState("");
   const [newProjectId, setNewProjectId] = useState("");
+  // API Key 相关状态
+  const [newBaseUrl, setNewBaseUrl] = useState("");
+  const [newApiKey, setNewApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
 
   // 初始化表单数据
   useEffect(() => {
@@ -80,6 +91,9 @@ export function EditCredentialModal({
       setNotSupportedModels(credential.not_supported_models || []);
       setNewCredFilePath("");
       setNewProjectId("");
+      setNewBaseUrl("");
+      setNewApiKey("");
+      setShowApiKey(false);
       setError(null);
     }
   }, [credential]);
@@ -89,12 +103,16 @@ export function EditCredentialModal({
   }
 
   const isOAuth = credential.credential_type.includes("oauth");
+  const isApiKey = credential.credential_type.includes("key");
 
   // 获取当前 provider 类型
   const getProviderType = (): PoolProviderType => {
     if (credential.credential_type.includes("kiro")) return "kiro";
     if (credential.credential_type.includes("gemini")) return "gemini";
     if (credential.credential_type.includes("qwen")) return "qwen";
+    if (credential.credential_type.includes("codex")) return "codex";
+    if (credential.credential_type === "claude_oauth") return "claude_oauth";
+    if (credential.credential_type.includes("iflow")) return "iflow";
     if (credential.credential_type.includes("openai")) return "openai";
     if (credential.credential_type.includes("claude")) return "claude";
     return "kiro";
@@ -150,6 +168,11 @@ export function EditCredentialModal({
         not_supported_models: notSupportedModels,
         new_creds_file_path: newCredFilePath.trim() || undefined,
         new_project_id: newProjectId.trim() || undefined,
+        // API Key 的 base_url（空字符串表示清除，undefined 表示不修改）
+        new_base_url: isApiKey ? newBaseUrl : undefined,
+        // API Key 的 api_key（空字符串表示不修改）
+        new_api_key:
+          isApiKey && newApiKey.trim() ? newApiKey.trim() : undefined,
       };
 
       await onEdit(credential.uuid, updateRequest);
@@ -286,6 +309,60 @@ export function EditCredentialModal({
                   />
                 </div>
               )}
+
+            {/* API Key 编辑 */}
+            {isApiKey && (
+              <>
+                <div>
+                  <label className="mb-1 block text-sm font-medium">
+                    API Key
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      value={newApiKey}
+                      onChange={(e) => setNewApiKey(e.target.value)}
+                      placeholder="留空保持当前 Key，或输入新的 API Key..."
+                      className="flex-1 rounded-lg border bg-background px-3 py-2 text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey(!showApiKey)}
+                      className="rounded-lg border p-2 hover:bg-muted"
+                      title={showApiKey ? "隐藏" : "显示"}
+                    >
+                      {showApiKey ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </button>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    当前: {credential.display_credential}
+                  </p>
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium">
+                    Base URL（可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={newBaseUrl}
+                    onChange={(e) => setNewBaseUrl(e.target.value)}
+                    placeholder={
+                      credential.credential_type === "openai_key"
+                        ? "https://api.openai.com/v1"
+                        : "https://api.anthropic.com/v1"
+                    }
+                    className="w-full rounded-lg border bg-background px-3 py-2 text-sm"
+                  />
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    留空使用默认 URL，或输入自定义代理地址
+                  </p>
+                </div>
+              </>
+            )}
 
             {/* 不支持的模型 - Checkbox Grid */}
             <div>

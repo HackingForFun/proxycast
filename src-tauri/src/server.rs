@@ -22,6 +22,7 @@ use crate::providers::gemini::GeminiProvider;
 use crate::providers::kiro::KiroProvider;
 use crate::providers::openai_custom::OpenAICustomProvider;
 use crate::providers::qwen::QwenProvider;
+use crate::providers::vertex::VertexProvider;
 use crate::services::provider_pool_service::ProviderPoolService;
 use crate::services::token_cache_service::TokenCacheService;
 use crate::telemetry::{RequestLog, RequestStatus};
@@ -189,6 +190,9 @@ pub struct ServerState {
     pub claude_custom_provider: ClaudeCustomProvider,
     pub default_provider_ref: Arc<RwLock<String>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// 服务器运行时使用的 API key（启动时从配置复制）
+    /// 用于 test_api 命令，确保测试使用的 API key 和服务器一致
+    pub running_api_key: Option<String>,
 }
 
 impl ServerState {
@@ -212,6 +216,7 @@ impl ServerState {
             claude_custom_provider: claude_custom,
             default_provider_ref,
             shutdown_tx: None,
+            running_api_key: None,
         }
     }
 
@@ -260,6 +265,7 @@ impl ServerState {
         let host = self.config.server.host.clone();
         let port = self.config.server.port;
         let api_key = self.config.server.api_key.clone();
+        let api_key_for_state = api_key.clone(); // 用于保存到 running_api_key
         let default_provider_ref = self.default_provider_ref.clone();
 
         // 重新加载凭证
@@ -309,6 +315,8 @@ impl ServerState {
 
         self.running = true;
         self.start_time = Some(std::time::Instant::now());
+        // 保存服务器运行时使用的 API key，用于 test_api 命令
+        self.running_api_key = Some(api_key_for_state);
         Ok(())
     }
 
@@ -318,6 +326,7 @@ impl ServerState {
         }
         self.running = false;
         self.start_time = None;
+        self.running_api_key = None;
     }
 }
 
@@ -359,6 +368,8 @@ struct AppState {
     hot_reload_manager: Option<Arc<HotReloadManager>>,
     /// 请求日志记录器（与 TelemetryState 共享）
     request_logger: Option<Arc<crate::telemetry::RequestLogger>>,
+    /// Amp CLI 路由器
+    amp_router: Arc<crate::router::AmpRouter>,
 }
 
 /// 启动配置文件监控
@@ -680,6 +691,15 @@ async fn run_server(
 
     let logs_clone = logs.clone();
     let db_clone = db.clone();
+
+    // 初始化 Amp CLI 路由器
+    let amp_router = Arc::new(crate::router::AmpRouter::new(
+        config
+            .as_ref()
+            .map(|c| c.ampcode.clone())
+            .unwrap_or_default(),
+    ));
+
     let state = AppState {
         api_key: api_key.to_string(),
         base_url,
@@ -699,6 +719,7 @@ async fn run_server(
         ws_stats,
         hot_reload_manager: hot_reload_manager.clone(),
         request_logger: shared_logger,
+        amp_router,
     };
 
     // 启动配置文件监控
@@ -719,6 +740,31 @@ async fn run_server(
     // 设置请求体大小限制为 100MB，支持大型上下文请求（如 Claude Code 的 /compact 命令）
     let body_limit = 100 * 1024 * 1024; // 100MB
 
+    // 创建管理 API 路由（带认证中间件）
+    let management_config = config
+        .as_ref()
+        .map(|c| c.remote_management.clone())
+        .unwrap_or_default();
+
+    let management_routes = Router::new()
+        .route("/v0/management/status", get(management_status))
+        .route(
+            "/v0/management/credentials",
+            get(management_list_credentials),
+        )
+        .route(
+            "/v0/management/credentials",
+            post(management_add_credential),
+        )
+        .route("/v0/management/config", get(management_get_config))
+        .route(
+            "/v0/management/config",
+            axum::routing::put(management_update_config),
+        )
+        .layer(crate::middleware::ManagementAuthLayer::new(
+            management_config,
+        ));
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -738,6 +784,23 @@ async fn run_server(
             "/:selector/v1/chat/completions",
             post(chat_completions_with_selector),
         )
+        // Amp CLI 路由
+        .route(
+            "/api/provider/:provider/v1/chat/completions",
+            post(amp_chat_completions),
+        )
+        .route("/api/provider/:provider/v1/messages", post(amp_messages))
+        // Amp CLI 管理代理路由
+        .route(
+            "/api/auth/*path",
+            axum::routing::any(amp_management_proxy_auth),
+        )
+        .route(
+            "/api/user/*path",
+            axum::routing::any(amp_management_proxy_user),
+        )
+        // 管理 API 路由
+        .merge(management_routes)
         .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state);
 
@@ -2354,6 +2417,397 @@ async fn chat_completions_with_selector(
     }
 }
 
+// ============ Amp CLI 路由处理 ============
+
+/// Amp CLI chat completions 处理
+///
+/// 处理 `/api/provider/:provider/v1/chat/completions` 路由
+/// 支持模型映射，将不可用模型映射到可用替代
+async fn amp_chat_completions(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    Json(mut request): Json<ChatCompletionRequest>,
+) -> Response {
+    if let Err(e) = verify_api_key(&headers, &state.api_key).await {
+        state.logs.write().await.add(
+            "warn",
+            &format!(
+                "Unauthorized request to /api/provider/{}/v1/chat/completions",
+                provider
+            ),
+        );
+        return e.into_response();
+    }
+
+    // 应用模型映射
+    let original_model = request.model.clone();
+    let mapped_model = state.amp_router.apply_model_mapping(&request.model);
+    if mapped_model != original_model {
+        state.logs.write().await.add(
+            "info",
+            &format!(
+                "[AMP] Model mapping applied: {} -> {}",
+                original_model, mapped_model
+            ),
+        );
+        request.model = mapped_model;
+    }
+
+    state.logs.write().await.add(
+        "info",
+        &format!(
+            "[AMP] POST /api/provider/{}/v1/chat/completions model={} stream={}",
+            provider, request.model, request.stream
+        ),
+    );
+
+    // 尝试根据 provider 名称选择凭证
+    let credential = match &state.db {
+        Some(db) => {
+            // 首先尝试按 provider 类型选择
+            if let Ok(Some(cred)) =
+                state
+                    .pool_service
+                    .select_credential(db, &provider, Some(&request.model))
+            {
+                Some(cred)
+            }
+            // 然后尝试按名称查找
+            else if let Ok(Some(cred)) = state.pool_service.get_by_name(db, &provider) {
+                Some(cred)
+            }
+            // 最后尝试按 UUID 查找
+            else if let Ok(Some(cred)) = state.pool_service.get_by_uuid(db, &provider) {
+                Some(cred)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    match credential {
+        Some(cred) => {
+            state.logs.write().await.add(
+                "info",
+                &format!(
+                    "[AMP] Using credential: type={} name={:?} uuid={}",
+                    cred.provider_type,
+                    cred.name,
+                    &cred.uuid[..8]
+                ),
+            );
+            call_provider_openai(&state, &cred, &request).await
+        }
+        None => {
+            state.logs.write().await.add(
+                "warn",
+                &format!(
+                    "[AMP] Credential not found for provider '{}', falling back to default",
+                    provider
+                ),
+            );
+            chat_completions_internal(&state, &request).await
+        }
+    }
+}
+
+/// Amp CLI messages 处理
+///
+/// 处理 `/api/provider/:provider/v1/messages` 路由
+/// 支持模型映射，将不可用模型映射到可用替代
+async fn amp_messages(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    Json(mut request): Json<AnthropicMessagesRequest>,
+) -> Response {
+    if let Err(e) = verify_api_key(&headers, &state.api_key).await {
+        state.logs.write().await.add(
+            "warn",
+            &format!(
+                "Unauthorized request to /api/provider/{}/v1/messages",
+                provider
+            ),
+        );
+        return e.into_response();
+    }
+
+    // 应用模型映射
+    let original_model = request.model.clone();
+    let mapped_model = state.amp_router.apply_model_mapping(&request.model);
+    if mapped_model != original_model {
+        state.logs.write().await.add(
+            "info",
+            &format!(
+                "[AMP] Model mapping applied: {} -> {}",
+                original_model, mapped_model
+            ),
+        );
+        request.model = mapped_model;
+    }
+
+    state.logs.write().await.add(
+        "info",
+        &format!(
+            "[AMP] POST /api/provider/{}/v1/messages model={} stream={}",
+            provider, request.model, request.stream
+        ),
+    );
+
+    // 尝试根据 provider 名称选择凭证
+    let credential = match &state.db {
+        Some(db) => {
+            // 首先尝试按 provider 类型选择
+            if let Ok(Some(cred)) =
+                state
+                    .pool_service
+                    .select_credential(db, &provider, Some(&request.model))
+            {
+                Some(cred)
+            }
+            // 然后尝试按名称查找
+            else if let Ok(Some(cred)) = state.pool_service.get_by_name(db, &provider) {
+                Some(cred)
+            }
+            // 最后尝试按 UUID 查找
+            else if let Ok(Some(cred)) = state.pool_service.get_by_uuid(db, &provider) {
+                Some(cred)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    match credential {
+        Some(cred) => {
+            state.logs.write().await.add(
+                "info",
+                &format!(
+                    "[AMP] Using credential: type={} name={:?} uuid={}",
+                    cred.provider_type,
+                    cred.name,
+                    &cred.uuid[..8]
+                ),
+            );
+            call_provider_anthropic(&state, &cred, &request).await
+        }
+        None => {
+            state.logs.write().await.add(
+                "warn",
+                &format!(
+                    "[AMP] Credential not found for provider '{}', falling back to default",
+                    provider
+                ),
+            );
+            anthropic_messages_internal(&state, &request).await
+        }
+    }
+}
+
+/// Amp CLI 管理代理 - auth 路由
+///
+/// 处理 `/api/auth/*` 路由，将请求代理到上游 URL
+async fn amp_management_proxy_auth(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    method: axum::http::Method,
+    body: axum::body::Bytes,
+) -> Response {
+    amp_management_proxy_internal(state, &format!("auth/{}", path), headers, method, body).await
+}
+
+/// Amp CLI 管理代理 - user 路由
+///
+/// 处理 `/api/user/*` 路由，将请求代理到上游 URL
+async fn amp_management_proxy_user(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    method: axum::http::Method,
+    body: axum::body::Bytes,
+) -> Response {
+    amp_management_proxy_internal(state, &format!("user/{}", path), headers, method, body).await
+}
+
+/// Amp CLI 管理代理内部实现
+///
+/// 处理 `/api/auth/*` 和 `/api/user/*` 路由
+/// 将请求代理到上游 URL
+///
+/// # 参数
+/// - `path`: 请求路径（不含 /api/ 前缀，如 "auth/login" 或 "user/profile"）
+async fn amp_management_proxy_internal(
+    state: AppState,
+    path: &str,
+    headers: HeaderMap,
+    method: axum::http::Method,
+    body: axum::body::Bytes,
+) -> Response {
+    let full_path = format!("/api/{}", path);
+
+    // 检查是否是管理路由
+    if !state.amp_router.is_management_route(&full_path) {
+        state.logs.write().await.add(
+            "warn",
+            &format!("[AMP] Invalid management route: {}", full_path),
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": {"message": "Not found"}})),
+        )
+            .into_response();
+    }
+
+    // 检查 localhost 限制
+    if state.amp_router.restrict_management_to_localhost() {
+        // 从 headers 中获取客户端 IP
+        let client_ip = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+            .or_else(|| {
+                headers
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+            });
+
+        if let Some(ip) = &client_ip {
+            let is_localhost = ip == "127.0.0.1" || ip == "::1" || ip == "localhost";
+            if !is_localhost {
+                state.logs.write().await.add(
+                    "warn",
+                    &format!("[AMP] Management proxy blocked from non-localhost: {}", ip),
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": {"message": "Management endpoints are restricted to localhost"}})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // 获取上游 URL
+    let upstream_url = match state.amp_router.get_management_upstream_path(&full_path) {
+        Some(url) => url,
+        None => {
+            state.logs.write().await.add(
+                "warn",
+                &format!("[AMP] No upstream URL configured for management proxy"),
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": {"message": "Upstream URL not configured"}})),
+            )
+                .into_response();
+        }
+    };
+
+    state.logs.write().await.add(
+        "info",
+        &format!(
+            "[AMP] Proxying management request: {} {} -> {}",
+            method, full_path, upstream_url
+        ),
+    );
+
+    // 创建 HTTP 客户端
+    let client = reqwest::Client::new();
+
+    // 构建请求
+    let mut request_builder = match method {
+        axum::http::Method::GET => client.get(&upstream_url),
+        axum::http::Method::POST => client.post(&upstream_url),
+        axum::http::Method::PUT => client.put(&upstream_url),
+        axum::http::Method::DELETE => client.delete(&upstream_url),
+        axum::http::Method::PATCH => client.patch(&upstream_url),
+        axum::http::Method::HEAD => client.head(&upstream_url),
+        axum::http::Method::OPTIONS => client.request(reqwest::Method::OPTIONS, &upstream_url),
+        _ => {
+            return (
+                StatusCode::METHOD_NOT_ALLOWED,
+                Json(serde_json::json!({"error": {"message": "Method not allowed"}})),
+            )
+                .into_response();
+        }
+    };
+
+    // 复制请求头（排除 host 和 content-length）
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str().to_lowercase();
+        if name_str != "host" && name_str != "content-length" {
+            if let Ok(value_str) = value.to_str() {
+                request_builder = request_builder.header(name.as_str(), value_str);
+            }
+        }
+    }
+
+    // 添加请求体
+    if !body.is_empty() {
+        request_builder = request_builder.body(body.to_vec());
+    }
+
+    // 发送请求
+    match request_builder.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let response_headers = response.headers().clone();
+
+            match response.bytes().await {
+                Ok(response_body) => {
+                    let mut builder = Response::builder().status(status.as_u16());
+
+                    // 复制响应头
+                    for (name, value) in response_headers.iter() {
+                        let name_str = name.as_str().to_lowercase();
+                        // 排除 transfer-encoding 和 content-length（axum 会自动处理）
+                        if name_str != "transfer-encoding" && name_str != "content-length" {
+                            builder = builder.header(name.as_str(), value.to_str().unwrap_or(""));
+                        }
+                    }
+
+                    builder
+                        .body(Body::from(response_body.to_vec()))
+                        .unwrap_or_else(|_| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": {"message": "Failed to build response"}})),
+                            )
+                                .into_response()
+                        })
+                }
+                Err(e) => {
+                    state.logs.write().await.add(
+                        "error",
+                        &format!("[AMP] Failed to read upstream response: {}", e),
+                    );
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({"error": {"message": format!("Failed to read upstream response: {}", e)}})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Err(e) => {
+            state.logs.write().await.add(
+                "error",
+                &format!("[AMP] Failed to proxy request to upstream: {}", e),
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": {"message": format!("Failed to connect to upstream: {}", e)}})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// 内部 Anthropic messages 处理 (使用默认 Kiro)
 async fn anthropic_messages_internal(
     state: &AppState,
@@ -3028,6 +3482,69 @@ async fn call_provider_anthropic(
                 }
             }
         }
+        CredentialData::VertexKey { api_key, base_url, .. } => {
+            // Vertex AI uses Gemini-compatible API, convert Anthropic to OpenAI format first
+            let openai_request = convert_anthropic_to_openai(request);
+            let vertex = VertexProvider::with_config(api_key.clone(), base_url.clone());
+            match vertex.chat_completions(&serde_json::to_value(&openai_request).unwrap_or_default()).await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(body) => {
+                            if status.is_success() {
+                                if let Some(db) = &state.db {
+                                    let _ = state.pool_service.mark_healthy(db, &credential.uuid, Some(&request.model));
+                                    let _ = state.pool_service.record_usage(db, &credential.uuid);
+                                }
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(body))
+                                    .unwrap_or_else(|_| {
+                                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": "Failed to build response"}}))).into_response()
+                                    })
+                            } else {
+                                if let Some(db) = &state.db {
+                                    let _ = state.pool_service.mark_unhealthy(db, &credential.uuid, Some(&body));
+                                }
+                                (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(serde_json::json!({"error": {"message": body}}))).into_response()
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(db) = &state.db {
+                                let _ = state.pool_service.mark_unhealthy(db, &credential.uuid, Some(&e.to_string()));
+                            }
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": e.to_string()}}))).into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(db) = &state.db {
+                        let _ = state.pool_service.mark_unhealthy(db, &credential.uuid, Some(&e.to_string()));
+                    }
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": e.to_string()}}))).into_response()
+                }
+            }
+        }
+        // Gemini API Key credentials - not supported for Anthropic format
+        CredentialData::GeminiApiKey { .. } => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message": "Gemini API Key credentials do not support Anthropic format"}})),
+            )
+                .into_response()
+        }
+        // 新增的凭证类型暂不支持 Anthropic 格式
+        CredentialData::CodexOAuth { .. }
+        | CredentialData::ClaudeOAuth { .. }
+        | CredentialData::IFlowOAuth { .. }
+        | CredentialData::IFlowCookie { .. } => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message": "This credential type does not support Anthropic format yet"}})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -3260,6 +3777,53 @@ async fn call_provider_openai(
                 )
                     .into_response(),
             }
+        }
+        CredentialData::VertexKey { api_key, base_url, model_aliases } => {
+            // Resolve model alias if present
+            let resolved_model = model_aliases.get(&request.model).cloned().unwrap_or_else(|| request.model.clone());
+            let mut modified_request = request.clone();
+            modified_request.model = resolved_model;
+
+            let vertex = VertexProvider::with_config(api_key.clone(), base_url.clone());
+            match vertex.chat_completions(&serde_json::to_value(&modified_request).unwrap_or_default()).await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        match resp.text().await {
+                            Ok(body) => {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                                    Json(json).into_response()
+                                } else {
+                                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": "Invalid JSON response"}}))).into_response()
+                                }
+                            }
+                            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": e.to_string()}}))).into_response(),
+                        }
+                    } else {
+                        let body = resp.text().await.unwrap_or_default();
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": body}}))).into_response()
+                    }
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": {"message": e.to_string()}}))).into_response(),
+            }
+        }
+        // Gemini API Key credentials - not supported for OpenAI format yet
+        CredentialData::GeminiApiKey { .. } => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message": "Gemini API Key credentials do not support OpenAI format yet"}})),
+            )
+                .into_response()
+        }
+        // 新增的凭证类型暂不支持 OpenAI 格式
+        CredentialData::CodexOAuth { .. }
+        | CredentialData::ClaudeOAuth { .. }
+        | CredentialData::IFlowOAuth { .. }
+        | CredentialData::IFlowCookie { .. } => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": {"message": "This credential type does not support OpenAI format yet"}})),
+            )
+                .into_response()
         }
     }
 }
@@ -4061,5 +4625,551 @@ async fn call_provider_anthropic_for_ws(
                 }
             }))
         }
+    }
+}
+
+// ============ Management API Types and Handlers ============
+
+/// 管理 API 状态响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementStatusResponse {
+    /// 服务器是否运行中
+    pub running: bool,
+    /// 监听地址
+    pub host: String,
+    /// 监听端口
+    pub port: u16,
+    /// 处理的请求数
+    pub requests: u64,
+    /// 运行时间（秒）
+    pub uptime_secs: u64,
+    /// 版本号
+    pub version: String,
+    /// TLS 是否启用
+    pub tls_enabled: bool,
+    /// 默认 Provider
+    pub default_provider: String,
+}
+
+/// 凭证信息（用于列表显示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialInfo {
+    /// 凭证 ID
+    pub id: String,
+    /// Provider 类型
+    pub provider_type: String,
+    /// 是否禁用
+    pub disabled: bool,
+    /// 是否有效
+    pub is_valid: bool,
+}
+
+/// 凭证列表响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialsListResponse {
+    /// 凭证列表
+    pub credentials: Vec<CredentialInfo>,
+    /// 总数
+    pub total: usize,
+}
+
+/// 添加凭证请求
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddCredentialRequest {
+    /// Provider 类型
+    pub provider_type: String,
+    /// 凭证 ID
+    pub id: String,
+    /// API Key（用于 API Key 类型的凭证）
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Token 文件路径（用于 OAuth 类型的凭证）
+    #[serde(default)]
+    pub token_file: Option<String>,
+    /// Base URL
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 代理 URL
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+/// 添加凭证响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddCredentialResponse {
+    /// 是否成功
+    pub success: bool,
+    /// 消息
+    pub message: String,
+    /// 凭证 ID
+    pub id: Option<String>,
+}
+
+/// 配置响应（简化版，不包含敏感信息）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementConfigResponse {
+    /// 服务器配置
+    pub server: ManagementServerConfigInfo,
+    /// 路由配置
+    pub routing: ManagementRoutingConfigInfo,
+    /// 重试配置
+    pub retry: ManagementRetryConfigInfo,
+    /// 远程管理配置（不包含 secret_key）
+    pub remote_management: ManagementRemoteInfo,
+}
+
+/// 服务器配置信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementServerConfigInfo {
+    pub host: String,
+    pub port: u16,
+    pub tls_enabled: bool,
+}
+
+/// 路由配置信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementRoutingConfigInfo {
+    pub default_provider: String,
+    pub rules_count: usize,
+}
+
+/// 重试配置信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementRetryConfigInfo {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+/// 远程管理配置信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementRemoteInfo {
+    pub allow_remote: bool,
+    pub has_secret_key: bool,
+    pub disable_control_panel: bool,
+}
+
+/// 更新配置请求
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateConfigRequest {
+    /// 默认 Provider
+    #[serde(default)]
+    pub default_provider: Option<String>,
+    /// 是否允许远程访问
+    #[serde(default)]
+    pub allow_remote: Option<bool>,
+}
+
+/// 更新配置响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfigResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// GET /v0/management/status - 获取服务器状态
+pub async fn management_status(State(state): State<AppState>) -> impl IntoResponse {
+    let default_provider = state.default_provider.read().await.clone();
+
+    // 获取请求数量
+    let requests = state.processor.stats.read().len() as u64;
+
+    let response = ManagementStatusResponse {
+        running: true,
+        host: "0.0.0.0".to_string(),
+        port: 8999,
+        requests,
+        uptime_secs: 0, // TODO: Track actual uptime
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        tls_enabled: false,
+        default_provider,
+    };
+
+    Json(response)
+}
+
+/// GET /v0/management/credentials - 获取凭证列表
+pub async fn management_list_credentials(State(state): State<AppState>) -> impl IntoResponse {
+    let mut credentials = Vec::new();
+
+    // 从数据库获取凭证列表
+    if let Some(ref db) = state.db {
+        if let Ok(conn) = db.lock() {
+            if let Ok(pool_credentials) = ProviderPoolDao::get_all(&conn) {
+                for cred in pool_credentials {
+                    credentials.push(CredentialInfo {
+                        id: cred.uuid.clone(),
+                        provider_type: cred.provider_type.to_string(),
+                        disabled: cred.is_disabled,
+                        is_valid: cred.is_healthy,
+                    });
+                }
+            }
+        }
+    }
+
+    let total = credentials.len();
+    Json(CredentialsListResponse { credentials, total })
+}
+
+/// POST /v0/management/credentials - 添加凭证
+pub async fn management_add_credential(
+    State(state): State<AppState>,
+    Json(request): Json<AddCredentialRequest>,
+) -> impl IntoResponse {
+    use crate::models::provider_pool_model::{
+        CredentialData, PoolProviderType, ProviderCredential,
+    };
+
+    // 验证请求
+    if request.id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AddCredentialResponse {
+                success: false,
+                message: "Credential ID is required".to_string(),
+                id: None,
+            }),
+        );
+    }
+
+    if request.provider_type.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AddCredentialResponse {
+                success: false,
+                message: "Provider type is required".to_string(),
+                id: None,
+            }),
+        );
+    }
+
+    // 解析 provider 类型
+    let provider_type: PoolProviderType = match request.provider_type.parse() {
+        Ok(pt) => pt,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AddCredentialResponse {
+                    success: false,
+                    message: format!("Invalid provider type: {}", request.provider_type),
+                    id: None,
+                }),
+            );
+        }
+    };
+
+    // 根据 provider 类型创建凭证数据
+    let credential_data = match provider_type {
+        PoolProviderType::OpenAI => {
+            if let Some(api_key) = request.api_key {
+                CredentialData::OpenAIKey {
+                    api_key,
+                    base_url: request.base_url,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "API key is required for OpenAI provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Claude => {
+            if let Some(api_key) = request.api_key {
+                CredentialData::ClaudeKey {
+                    api_key,
+                    base_url: request.base_url,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "API key is required for Claude provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Vertex => {
+            if let Some(api_key) = request.api_key {
+                CredentialData::VertexKey {
+                    api_key,
+                    base_url: request.base_url,
+                    model_aliases: std::collections::HashMap::new(),
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "API key is required for Vertex provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Kiro => {
+            if let Some(token_file) = request.token_file {
+                CredentialData::KiroOAuth {
+                    creds_file_path: token_file,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for Kiro provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Gemini => {
+            if let Some(token_file) = request.token_file {
+                CredentialData::GeminiOAuth {
+                    creds_file_path: token_file,
+                    project_id: None,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for Gemini provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Qwen => {
+            if let Some(token_file) = request.token_file {
+                CredentialData::QwenOAuth {
+                    creds_file_path: token_file,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for Qwen provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Antigravity => {
+            if let Some(token_file) = request.token_file {
+                CredentialData::AntigravityOAuth {
+                    creds_file_path: token_file,
+                    project_id: None,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for Antigravity provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::GeminiApiKey => {
+            if let Some(api_key) = request.api_key {
+                CredentialData::GeminiApiKey {
+                    api_key,
+                    base_url: request.base_url,
+                    excluded_models: Vec::new(),
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "API key is required for Gemini API Key provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::Codex => {
+            if let Some(token_file) = request.token_file {
+                CredentialData::CodexOAuth {
+                    creds_file_path: token_file,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for Codex provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::ClaudeOAuth => {
+            if let Some(token_file) = request.token_file {
+                CredentialData::ClaudeOAuth {
+                    creds_file_path: token_file,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for Claude OAuth provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+        PoolProviderType::IFlow => {
+            if let Some(token_file) = request.token_file {
+                // 默认使用 OAuth 类型，Cookie 类型需要通过其他方式添加
+                CredentialData::IFlowOAuth {
+                    creds_file_path: token_file,
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AddCredentialResponse {
+                        success: false,
+                        message: "Token file is required for iFlow provider".to_string(),
+                        id: None,
+                    }),
+                );
+            }
+        }
+    };
+
+    // 创建凭证
+    let mut credential = ProviderCredential::new(provider_type, credential_data);
+    credential.uuid = request.id.clone();
+    credential.name = Some(request.id.clone());
+
+    // 添加凭证到数据库
+    if let Some(ref db) = state.db {
+        if let Ok(conn) = db.lock() {
+            match ProviderPoolDao::insert(&conn, &credential) {
+                Ok(_) => {
+                    tracing::info!(
+                        "[MANAGEMENT] Added credential: {} ({})",
+                        request.id,
+                        request.provider_type
+                    );
+                    return (
+                        StatusCode::CREATED,
+                        Json(AddCredentialResponse {
+                            success: true,
+                            message: "Credential added successfully".to_string(),
+                            id: Some(request.id),
+                        }),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("[MANAGEMENT] Failed to add credential: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(AddCredentialResponse {
+                            success: false,
+                            message: format!("Failed to add credential: {}", e),
+                            id: None,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(AddCredentialResponse {
+            success: false,
+            message: "Database not available".to_string(),
+            id: None,
+        }),
+    )
+}
+
+/// GET /v0/management/config - 获取配置
+pub async fn management_get_config(State(state): State<AppState>) -> impl IntoResponse {
+    let default_provider = state.default_provider.read().await.clone();
+
+    // 获取路由规则数量
+    let rules_count = state.processor.router.read().await.rules().len();
+
+    let response = ManagementConfigResponse {
+        server: ManagementServerConfigInfo {
+            host: "0.0.0.0".to_string(),
+            port: 8999,
+            tls_enabled: false,
+        },
+        routing: ManagementRoutingConfigInfo {
+            default_provider,
+            rules_count,
+        },
+        retry: ManagementRetryConfigInfo {
+            max_retries: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 30000,
+        },
+        remote_management: ManagementRemoteInfo {
+            allow_remote: false,
+            has_secret_key: true,
+            disable_control_panel: false,
+        },
+    };
+
+    Json(response)
+}
+
+/// PUT /v0/management/config - 更新配置
+pub async fn management_update_config(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateConfigRequest>,
+) -> impl IntoResponse {
+    let mut updated = false;
+
+    // 更新默认 Provider
+    if let Some(provider) = request.default_provider {
+        // 验证 provider 类型
+        if provider.parse::<crate::ProviderType>().is_ok() {
+            let mut dp = state.default_provider.write().await;
+            *dp = provider.clone();
+            tracing::info!("[MANAGEMENT] Updated default_provider to: {}", provider);
+            updated = true;
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(UpdateConfigResponse {
+                    success: false,
+                    message: format!("Invalid provider type: {}", provider),
+                }),
+            );
+        }
+    }
+
+    if updated {
+        (
+            StatusCode::OK,
+            Json(UpdateConfigResponse {
+                success: true,
+                message: "Configuration updated successfully".to_string(),
+            }),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(UpdateConfigResponse {
+                success: true,
+                message: "No changes applied".to_string(),
+            }),
+        )
     }
 }

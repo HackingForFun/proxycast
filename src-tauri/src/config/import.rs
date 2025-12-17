@@ -367,6 +367,10 @@ impl ImportService {
             qwen: Self::merge_credential_entries(&current.qwen, &imported.qwen),
             openai: Self::merge_api_key_entries(&current.openai, &imported.openai),
             claude: Self::merge_api_key_entries(&current.claude, &imported.claude),
+            gemini_api_keys: imported.gemini_api_keys.clone(),
+            vertex_api_keys: imported.vertex_api_keys.clone(),
+            codex: Self::merge_credential_entries(&current.codex, &imported.codex),
+            iflow: imported.iflow.clone(),
         }
     }
 
@@ -655,6 +659,7 @@ server:
             api_key: "sk-existing".to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         });
 
         let yaml = r#"
@@ -683,17 +688,20 @@ credential_pool:
             id: "id1".to_string(),
             token_file: "old.json".to_string(),
             disabled: false,
+            proxy_url: None,
         }];
         let imported = vec![
             CredentialEntry {
                 id: "id1".to_string(),
                 token_file: "new.json".to_string(),
                 disabled: true,
+                proxy_url: None,
             },
             CredentialEntry {
                 id: "id2".to_string(),
                 token_file: "id2.json".to_string(),
                 disabled: false,
+                proxy_url: None,
             },
         ];
 
@@ -713,12 +721,14 @@ credential_pool:
             api_key: "sk-real".to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         }];
         let imported = vec![ApiKeyEntry {
             id: "id1".to_string(),
             api_key: REDACTED_PLACEHOLDER.to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         }];
 
         let merged = ImportService::merge_api_key_entries(&current, &imported);
@@ -737,12 +747,14 @@ credential_pool:
             api_key: REDACTED_PLACEHOLDER.to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         });
         config.credential_pool.openai.push(ApiKeyEntry {
             id: "real".to_string(),
             api_key: "sk-real".to_string(),
             base_url: None,
             disabled: false,
+            proxy_url: None,
         });
 
         ImportService::clean_redacted_credentials(&mut config);
