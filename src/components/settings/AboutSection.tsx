@@ -23,7 +23,7 @@ interface ToolVersion {
 
 export function AboutSection() {
   const [versionInfo, setVersionInfo] = useState<VersionInfo>({
-    current: "0.14.0",
+    current: "",
     latest: undefined,
     hasUpdate: false,
     downloadUrl: undefined,
@@ -32,6 +32,23 @@ export function AboutSection() {
   const [checking, setChecking] = useState(false);
   const [toolVersions, setToolVersions] = useState<ToolVersion[]>([]);
   const [loadingTools, setLoadingTools] = useState(true);
+
+  // 加载当前版本号（从后端获取，确保与 Cargo.toml 同步）
+  useEffect(() => {
+    const loadCurrentVersion = async () => {
+      try {
+        // check_for_updates 会返回当前版本号
+        const result = await invoke<VersionInfo>("check_for_updates");
+        setVersionInfo((prev) => ({
+          ...prev,
+          current: result.current,
+        }));
+      } catch (error) {
+        console.error("Failed to load version:", error);
+      }
+    };
+    loadCurrentVersion();
+  }, []);
 
   // 加载本地工具版本
   useEffect(() => {
