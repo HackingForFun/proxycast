@@ -3377,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "proxycast"
-version = "0.14.6"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3394,6 +3394,7 @@ dependencies = [
  "indexmap 2.12.1",
  "md5",
  "notify",
+ "once_cell",
  "open",
  "parking_lot",
  "proptest",

@@ -1,6 +1,6 @@
 [package]
 name = "proxycast"
-version = "0.14.6"
+version = "0.15.1"
 description = "AI API Proxy Desktop App"
 authors = ["you"]
 edition = "2021"
@@ -58,6 +58,7 @@ sha2 = "0.10"
 serde_urlencoded = "0.7"
 open = "5"
 url = "2"
+once_cell = "1"
 
 [dev-dependencies]
 proptest = "1"

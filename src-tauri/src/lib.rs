@@ -14,6 +14,7 @@ pub mod proxy;
 pub mod resilience;
 pub mod router;
 mod server;
+mod server_utils;
 mod services;
 pub mod telemetry;
 pub mod tray;
@@ -58,6 +59,14 @@ pub enum ProviderType {
     /// Gemini API Key (multi-account load balancing)
     #[serde(rename = "gemini_api_key")]
     GeminiApiKey,
+    /// Codex (OpenAI OAuth)
+    Codex,
+    /// Claude OAuth (Anthropic OAuth)
+    #[serde(rename = "claude_oauth")]
+    ClaudeOAuth,
+    /// iFlow
+    #[serde(rename = "iflow")]
+    IFlow,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -71,6 +80,9 @@ impl std::fmt::Display for ProviderType {
             ProviderType::Antigravity => write!(f, "antigravity"),
             ProviderType::Vertex => write!(f, "vertex"),
             ProviderType::GeminiApiKey => write!(f, "gemini_api_key"),
+            ProviderType::Codex => write!(f, "codex"),
+            ProviderType::ClaudeOAuth => write!(f, "claude_oauth"),
+            ProviderType::IFlow => write!(f, "iflow"),
         }
     }
 }
@@ -88,6 +100,9 @@ impl std::str::FromStr for ProviderType {
             "antigravity" => Ok(ProviderType::Antigravity),
             "vertex" => Ok(ProviderType::Vertex),
             "gemini_api_key" => Ok(ProviderType::GeminiApiKey),
+            "codex" => Ok(ProviderType::Codex),
+            "claude_oauth" => Ok(ProviderType::ClaudeOAuth),
+            "iflow" => Ok(ProviderType::IFlow),
             _ => Err(format!("Invalid provider: {s}")),
         }
     }
@@ -1030,6 +1045,12 @@ async fn check_api_compatibility(
             ("gemini-2.5-flash", "basic"),
             ("gemini-2.5-flash", "tool_call"),
         ],
+        ProviderType::Codex => vec![("gpt-4.1", "basic"), ("gpt-4.1", "tool_call")],
+        ProviderType::ClaudeOAuth => vec![
+            ("claude-sonnet-4-5", "basic"),
+            ("claude-sonnet-4-5", "tool_call"),
+        ],
+        ProviderType::IFlow => vec![("gpt-4o", "basic"), ("gpt-4o", "tool_call")],
         ProviderType::OpenAI | ProviderType::Claude => vec![],
     };
 
@@ -1751,6 +1772,20 @@ pub fn run() {
             commands::provider_pool_cmd::debug_kiro_credentials,
             commands::provider_pool_cmd::test_user_credentials,
             commands::provider_pool_cmd::migrate_private_config_to_pool,
+            commands::provider_pool_cmd::start_antigravity_oauth_login,
+            commands::provider_pool_cmd::get_antigravity_auth_url_and_wait,
+            commands::provider_pool_cmd::get_codex_auth_url_and_wait,
+            commands::provider_pool_cmd::start_codex_oauth_login,
+            commands::provider_pool_cmd::get_claude_oauth_auth_url_and_wait,
+            commands::provider_pool_cmd::start_claude_oauth_login,
+            commands::provider_pool_cmd::get_qwen_device_code_and_wait,
+            commands::provider_pool_cmd::start_qwen_device_code_login,
+            commands::provider_pool_cmd::get_iflow_auth_url_and_wait,
+            commands::provider_pool_cmd::start_iflow_oauth_login,
+            commands::provider_pool_cmd::get_gemini_auth_url_and_wait,
+            commands::provider_pool_cmd::start_gemini_oauth_login,
+            commands::provider_pool_cmd::exchange_gemini_code,
+            commands::provider_pool_cmd::get_kiro_credential_fingerprint,
             // Route commands
             commands::route_cmd::get_available_routes,
             commands::route_cmd::get_route_curl_examples,
